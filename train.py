@@ -144,7 +144,9 @@ def validate(model, criterion, valset, iteration, batch_size, n_gpus,
     if rank == 0:
         print("Validation loss {}: {:9f}  ".format(iteration, val_loss))
         logger.log_validation(val_loss, model, y, y_pred, iteration)
+        return val_loss
 
+    return None
 
 def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
           rank, group_name, hparams):
@@ -184,6 +186,9 @@ def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
         output_directory, log_directory, rank)
 
     train_loader, valset, collate_fn = prepare_dataloaders(hparams)
+    len_train_loader = len(train_loader)
+    if len_train_loader == 0:
+        raise RuntimeError("train_loader is empty")
 
     # Load checkpoint if one exists
     iteration = 0
@@ -202,6 +207,8 @@ def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
 
     model.train()
     is_overflow = False
+    best_val_loss = None
+    best_last_chk = None
     # ================ MAIN TRAINNIG LOOP! ===================
     for epoch in range(epoch_offset, hparams.epochs):
         print("Epoch: {}".format(epoch))
@@ -243,14 +250,21 @@ def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
                     reduced_loss, grad_norm, learning_rate, duration, iteration)
 
             if not is_overflow and (iteration % hparams.iters_per_checkpoint == 0):
-                validate(model, criterion, valset, iteration,
+                val_loss = validate(model, criterion, valset, iteration,
                          hparams.batch_size, n_gpus, collate_fn, logger,
                          hparams.distributed_run, rank)
-                if rank == 0:
-                    checkpoint_path = os.path.join(
-                        output_directory, "checkpoint_{}".format(iteration))
-                    save_checkpoint(model, optimizer, learning_rate, iteration,
-                                    checkpoint_path)
+                save_new_checkpoint = best_val_loss is None or val_loss < best_val_loss
+                if save_new_checkpoint:
+                    best_val_loss = val_loss
+                    if rank == 0:
+                        old_chk = best_last_chk
+                        checkpoint_path = os.path.join(output_directory, "checkpoint_{}".format(iteration))
+                        save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path)
+                        best_last_chk = checkpoint_path
+                        if old_chk is not None and os.path.exists(old_chk):
+                            os.remove(old_chk)
+                            print(f"Removed old checkpoint '{old_chk}'")
+                else: print(f"Ignored saving checkpoint {iteration} (val_loss={val_loss} > best_val_loss={best_val_loss})")
 
             iteration += 1
 
